@@ -1,0 +1,11 @@
+[package]
+name = "scene-manager"
+version = "0.1.0"
+edition = "2024"
+
+authors = ["Ash Walker <ash@ashwalker.net>"]
+repository = "https://github.com/SignalWalker/godot.lib.scene-manager-rs"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+godot = "^0.5"
