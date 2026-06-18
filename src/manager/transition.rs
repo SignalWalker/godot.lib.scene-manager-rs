@@ -1,0 +1,171 @@
+use std::rc::Rc;
+
+use godot::{
+    classes::{AnimationPlayer, Node},
+    prelude::Gd,
+    task::FallibleSignalFutureError,
+};
+
+use crate::idle::IdleTask;
+
+mod scene_transition_inner;
+use scene_transition_inner::*;
+
+#[derive(thiserror::Error, Debug)]
+pub enum SceneTransitionError {
+    #[error("unrecognized scene transition type: {}", 0)]
+    UnrecognizedTransitionType(Gd<Node>),
+}
+
+trait TransitionDriver {
+    #[must_use]
+    fn start<'future>(
+        &'future mut self,
+    ) -> impl Future<Output = Result<(), FallibleSignalFutureError>> + 'future;
+
+    #[must_use]
+    fn finish(self) -> impl Future<Output = Result<(), FallibleSignalFutureError>>;
+}
+
+struct SceneTransition {
+    inner: SceneTransitionInner,
+}
+
+impl SceneTransition {
+    fn new(transition: Gd<Node>) -> Result<Self, SceneTransitionError> {
+        if let Ok(anim) = transition.clone().try_cast::<AnimationPlayer>() {
+            Ok(Self {
+                inner: SceneTransitionInner::Animation(SceneTransitionAnimation::new(anim)),
+            })
+        } else {
+            Err(SceneTransitionError::UnrecognizedTransitionType(transition))
+        }
+    }
+
+    #[must_use]
+    fn start(&mut self) -> impl Future<Output = Result<(), FallibleSignalFutureError>> {
+        match &mut self.inner {
+            SceneTransitionInner::Animation(anim) => anim.start(),
+        }
+    }
+
+    /// Returns a [Future] that finishes when the scene transition is finished and ready to be
+    /// popped from the scene stack.
+    #[must_use]
+    fn finish(self) -> impl Future<Output = Result<(), FallibleSignalFutureError>> {
+        match self.inner {
+            SceneTransitionInner::Animation(anim) => anim.finish(),
+        }
+    }
+}
+
+impl super::SceneManager {
+    /// # Safety
+    ///
+    /// Must only be called in contexts in which it's safe to mutate the scene tree.
+    pub unsafe fn transition_scene<'result>(
+        self: Rc<Self>,
+        transition_node: Gd<Node>,
+        next_scene: impl Future<Output = Gd<Node>> + 'result,
+    ) -> Result<impl Future<Output = Gd<Node>> + 'result, SceneTransitionError> {
+        tracing::info!(
+            %transition_node,
+            "transition_scene"
+        );
+        // construct the transition...
+        let mut transition = SceneTransition::new(transition_node.clone())?;
+
+        let old_scene = self.current_scene().map(|s| s.clone());
+
+        // put it on the scene stack...
+        unsafe {
+            self.push_scene(transition_node);
+        }
+
+        // wait for it to finish...
+        Ok(async move {
+            tracing::trace!("waiting on transition.start()"); // me irl
+            // wait for the transition to be ready...
+            if let Err(error) = transition.start().await {
+                tracing::error!(%error, "scene transition start");
+            }
+
+            tracing::trace!("removing old scene");
+            // remove the old scene...
+            if let Some(old_scene) = old_scene {
+                if self
+                    .scene_stack
+                    .borrow()
+                    .iter()
+                    .any(|sc| sc.scene == old_scene)
+                {
+                    let manager = self.clone();
+                    tracing::trace!("waiting on IdleTask for old scene to be removed and freed");
+                    unsafe {
+                        IdleTask::defer_local(move || {
+                            #[allow(unused_unsafe)]
+                            let Some(old_scene) = (unsafe { manager.try_remove_scene(&old_scene) })
+                            else {
+                                tracing::error!(
+                                    %old_scene,
+                                    "old scene removed during scene transition without permission",
+                                );
+                                return;
+                            };
+                            old_scene.free();
+                        })
+                    }
+                    .await;
+                } else {
+                    tracing::error!(
+                        %old_scene,
+                        "old scene removed during scene transition without permission",
+                    );
+                }
+            }
+
+            tracing::trace!("waiting on new scene to be inserted");
+            // swap the scene...
+            let next = next_scene.await;
+            let manager = self.clone();
+            let next_df = next.clone();
+            unsafe {
+                IdleTask::defer_local(move || {
+                    #[allow(unused_unsafe)]
+                    // NOTE :: have to do this on its own line so the borrow gets dropped
+                    let index = manager.len().saturating_sub(1);
+                    unsafe {
+                        manager.insert_scene(index, next_df);
+                    }
+                })
+                .await;
+            }
+
+            tracing::trace!("waiting on transition.finish()"); // me irl...
+            // finish the transition...
+            if let Err(error) = transition.finish().await {
+                tracing::error!(%error, "scene transition finish");
+            };
+
+            tracing::trace!("removing scene transition");
+            // remove the transition...
+            let manager = self.clone();
+            unsafe {
+                IdleTask::defer_local(move || {
+                    #[allow(unused_unsafe)]
+                    let Some(transition) = (unsafe { manager.pop_scene() }) else {
+                        tracing::error!(
+                            "tried to pop scene transition, but there are no scenes on the stack"
+                        );
+                        return;
+                    };
+                    transition.free();
+                })
+                .await;
+            }
+
+            // we're done yay
+            next
+        })
+    }
+}

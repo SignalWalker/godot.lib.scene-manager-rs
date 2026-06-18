@@ -8,4 +8,17 @@ repository = "https://github.com/SignalWalker/godot.lib.scene-manager-rs"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-godot = "^0.5"
+godot = { version = "^0.5", features = ["experimental-threads"] }
+
+parking_lot = "^0.12"
+
+futures = "^0.3"
+
+uuid = { version = "^1.23", features = ["v4"] }
+
+thiserror = "^2.0"
+
+tracing = "^0.1"
+
+[lib]
+crate-type = ["cdylib", "rlib"]

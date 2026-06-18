@@ -1,14 +1,16 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+mod ext;
+pub use ext::*;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod plugin;
+pub use plugin::*;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+mod manager;
+pub use manager::*;
+
+pub mod resource;
+
+pub mod settings;
+
+pub mod promise;
+
+pub mod idle;
