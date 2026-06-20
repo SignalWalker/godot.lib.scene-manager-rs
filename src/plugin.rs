@@ -1,7 +1,7 @@
 use godot::{
     classes::{EditorPlugin, IEditorPlugin},
     init::is_editor_hint,
-    obj::{Base, WithBaseField},
+    obj::Base,
     register::{GodotClass, godot_api},
 };
 

@@ -108,7 +108,9 @@ impl SceneManagerNode {
                 }
             };
             godot::task::spawn(async move {
-                task.await;
+                if let Err(error) = task.await {
+                    tracing::error!(%error, "could not complete scene transition");
+                };
             });
         });
     }

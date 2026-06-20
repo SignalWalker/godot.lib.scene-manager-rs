@@ -28,12 +28,10 @@ impl<T> From<IdleTaskError<T>> for SceneTransitionError {
 }
 
 trait TransitionDriver {
-    #[must_use]
     fn start<'future>(
         &'future mut self,
     ) -> impl Future<Output = Result<(), FallibleSignalFutureError>> + 'future;
 
-    #[must_use]
     fn finish(self) -> impl Future<Output = Result<(), FallibleSignalFutureError>>;
 }
 
@@ -52,7 +50,6 @@ impl SceneTransition {
         }
     }
 
-    #[must_use]
     fn start(&mut self) -> impl Future<Output = Result<(), FallibleSignalFutureError>> {
         match &mut self.inner {
             SceneTransitionInner::Animation(anim) => anim.start(),
@@ -61,7 +58,6 @@ impl SceneTransition {
 
     /// Returns a [Future] that finishes when the scene transition is finished and ready to be
     /// popped from the scene stack.
-    #[must_use]
     fn finish(self) -> impl Future<Output = Result<(), FallibleSignalFutureError>> {
         match self.inner {
             SceneTransitionInner::Animation(anim) => anim.finish(),
@@ -115,7 +111,6 @@ impl super::SceneManager {
                     let manager = self.clone();
                     tracing::trace!("waiting on IdleTask for old scene to be removed and freed");
                     IdleTask::defer_local(move || {
-                        #[allow(unused_unsafe)]
                         let Some(old_scene) = (unsafe { manager.try_remove_scene(&old_scene) })
                         else {
                             tracing::error!(
@@ -141,7 +136,6 @@ impl super::SceneManager {
             let manager = self.clone();
             let next_df = next.clone();
             IdleTask::defer_local(move || {
-                #[allow(unused_unsafe)]
                 // NOTE :: have to do this on its own line so the borrow gets dropped
                 let index = manager.len().saturating_sub(1);
                 unsafe {
@@ -160,7 +154,6 @@ impl super::SceneManager {
             // remove the transition...
             let manager = self.clone();
             IdleTask::defer_local(move || {
-                #[allow(unused_unsafe)]
                 let Some(transition) = (unsafe { manager.pop_scene() }) else {
                     tracing::error!(
                         "tried to pop scene transition, but there are no scenes on the stack"

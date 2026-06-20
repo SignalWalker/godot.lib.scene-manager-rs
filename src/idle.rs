@@ -1,13 +1,6 @@
 use std::{sync::Arc, task::Waker};
 
-use godot::{
-    classes::{
-        Engine,
-        class_macros::private::virtuals::ZipReader::{Callable, RustCallable, Variant},
-    },
-    init::is_main_thread,
-    obj::Singleton,
-};
+use godot::classes::class_macros::private::virtuals::ZipReader::{Callable, RustCallable, Variant};
 use parking_lot::Mutex;
 
 #[derive(thiserror::Error, Debug)]
@@ -54,7 +47,7 @@ impl<O, T: FnOnce() -> O> std::fmt::Display for IdleTask<O, T> {
 }
 
 impl<O: Send + 'static, T: FnOnce() -> O + Send + 'static> RustCallable for IdleTask<O, T> {
-    fn invoke(&mut self, args: &[&Variant]) -> Variant {
+    fn invoke(&mut self, _: &[&Variant]) -> Variant {
         Self::invoke(self);
         Variant::nil()
     }
@@ -103,7 +96,6 @@ impl<O, T: FnOnce() -> O> IdleTask<O, T> {
         }
     }
 
-    #[must_use]
     pub fn defer_local(task: T) -> Result<Self, IdleTaskError<T>>
     where
         O: 'static,
