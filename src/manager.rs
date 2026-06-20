@@ -70,7 +70,7 @@ impl SceneManager {
     /// Must only be called in contexts where it's safe to modify the scene tree.
     #[tracing::instrument]
     pub unsafe fn push_scene(&self, new: Gd<Node>) {
-        tracing::info!(scene = %new, "push_scene");
+        tracing::debug!(scene = %new, "push_scene");
         if let Some(mut parent) = new.get_parent() {
             tracing::error!(
                 %parent,
@@ -100,7 +100,7 @@ impl SceneManager {
     #[must_use]
     #[tracing::instrument]
     pub unsafe fn pop_scene(&self) -> Option<Gd<Node>> {
-        tracing::info!("pop_scene");
+        tracing::debug!("pop_scene");
         // NOTE :: you can't just use `if let Some(old) = self.scene_stack.borrow_mut().pop()` here
         // because then the RefMut stays in scope
         let old = self.scene_stack.borrow_mut().pop();
@@ -124,7 +124,7 @@ impl SceneManager {
     /// Must only be called in contexts in which it's safe to mutate the scene tree.
     #[tracing::instrument]
     pub unsafe fn insert_scene(&self, index: usize, new: Gd<Node>) {
-        tracing::info!(index, scene = %new, "insert_scene");
+        tracing::debug!(index, scene = %new, "insert_scene");
         debug_assert!(index <= self.scene_stack.borrow().len());
 
         if index == self.scene_stack.borrow().len() {
@@ -166,7 +166,7 @@ impl SceneManager {
     #[must_use]
     #[tracing::instrument]
     pub unsafe fn try_remove_scene_at(&self, index: usize) -> Option<Gd<Node>> {
-        tracing::info!(index, "try_remove_scene_at");
+        tracing::debug!(index, "try_remove_scene_at");
         if index >= self.scene_stack.borrow().len() {
             tracing::error!(
                 index,
@@ -197,7 +197,7 @@ impl SceneManager {
     #[must_use]
     #[tracing::instrument]
     pub unsafe fn try_remove_scene(&self, scene: &Gd<Node>) -> Option<Gd<Node>> {
-        tracing::info!(?scene, "try_remove_scene");
+        tracing::debug!(?scene, "try_remove_scene");
         let Some(index) = self
             .scene_stack
             .borrow()

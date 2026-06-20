@@ -1,7 +1,20 @@
 use std::{sync::Arc, task::Waker};
 
-use godot::classes::class_macros::private::virtuals::ZipReader::{Callable, RustCallable, Variant};
+use godot::{
+    classes::{
+        Engine,
+        class_macros::private::virtuals::ZipReader::{Callable, RustCallable, Variant},
+    },
+    init::is_main_thread,
+    obj::Singleton,
+};
 use parking_lot::Mutex;
+
+#[derive(thiserror::Error, Debug)]
+pub enum IdleTaskError<Task> {
+    #[error("called defer_local from outside the main thread")]
+    NotMainThread(Task),
+}
 
 /// A [RustCallable] that gets executed during idle time, and can be awaited as a [Future].
 pub struct IdleTask<Output, Task: FnOnce() -> Output> {
@@ -42,10 +55,6 @@ impl<O, T: FnOnce() -> O> std::fmt::Display for IdleTask<O, T> {
 
 impl<O: Send + 'static, T: FnOnce() -> O + Send + 'static> RustCallable for IdleTask<O, T> {
     fn invoke(&mut self, args: &[&Variant]) -> Variant {
-        #[cfg(debug_assertions)]
-        if !args.is_empty() {
-            tracing::warn!(task = %self, params = ?args, "invoked IdleTask with parameters; ignoring");
-        }
         Self::invoke(self);
         Variant::nil()
     }
@@ -94,28 +103,24 @@ impl<O, T: FnOnce() -> O> IdleTask<O, T> {
         }
     }
 
-    /// # Safety
-    ///
-    /// Must only be called from the main thread.
     #[must_use]
-    pub unsafe fn defer_local(task: T) -> Self
+    pub fn defer_local(task: T) -> Result<Self, IdleTaskError<T>>
     where
         O: 'static,
         T: 'static,
     {
+        if !godot::init::is_main_thread() {
+            return Err(IdleTaskError::NotMainThread(task));
+        }
         tracing::trace!("deferring local task");
         let returned = Self::new(task);
         let mut task = returned.clone();
-        Callable::from_fn(task.to_string(), move |args: &[&Variant]| -> () {
-            tracing::trace!("invoking local task");
-            #[cfg(debug_assertions)]
-            if !args.is_empty() {
-                tracing::warn!(%task, params = ?args, "invoked IdleTask with parameters; ignoring");
-            }
+        Callable::from_fn(task.to_string(), move |_: &[&Variant]| -> () {
+            tracing::trace!(%task, "invoking local task");
             task.invoke();
         })
         .call_deferred(&[]);
-        returned
+        Ok(returned)
     }
 
     #[must_use]

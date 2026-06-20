@@ -6,7 +6,7 @@ use godot::{
     task::FallibleSignalFutureError,
 };
 
-use crate::idle::IdleTask;
+use crate::idle::{IdleTask, IdleTaskError};
 
 mod scene_transition_inner;
 use scene_transition_inner::*;
@@ -15,6 +15,16 @@ use scene_transition_inner::*;
 pub enum SceneTransitionError {
     #[error("unrecognized scene transition type: {}", 0)]
     UnrecognizedTransitionType(Gd<Node>),
+    #[error("scene transition processed outside the main thread")]
+    NotMainThread,
+}
+
+impl<T> From<IdleTaskError<T>> for SceneTransitionError {
+    fn from(value: IdleTaskError<T>) -> Self {
+        match value {
+            IdleTaskError::NotMainThread(_) => Self::NotMainThread,
+        }
+    }
 }
 
 trait TransitionDriver {
@@ -67,8 +77,11 @@ impl super::SceneManager {
         self: Rc<Self>,
         transition_node: Gd<Node>,
         next_scene: impl Future<Output = Gd<Node>> + 'result,
-    ) -> Result<impl Future<Output = Gd<Node>> + 'result, SceneTransitionError> {
-        tracing::info!(
+    ) -> Result<
+        impl Future<Output = Result<Gd<Node>, SceneTransitionError>> + 'result,
+        SceneTransitionError,
+    > {
+        tracing::debug!(
             %transition_node,
             "transition_scene"
         );
@@ -101,20 +114,18 @@ impl super::SceneManager {
                 {
                     let manager = self.clone();
                     tracing::trace!("waiting on IdleTask for old scene to be removed and freed");
-                    unsafe {
-                        IdleTask::defer_local(move || {
-                            #[allow(unused_unsafe)]
-                            let Some(old_scene) = (unsafe { manager.try_remove_scene(&old_scene) })
-                            else {
-                                tracing::error!(
-                                    %old_scene,
-                                    "old scene removed during scene transition without permission",
-                                );
-                                return;
-                            };
-                            old_scene.free();
-                        })
-                    }
+                    IdleTask::defer_local(move || {
+                        #[allow(unused_unsafe)]
+                        let Some(old_scene) = (unsafe { manager.try_remove_scene(&old_scene) })
+                        else {
+                            tracing::error!(
+                                %old_scene,
+                                "old scene removed during scene transition without permission",
+                            );
+                            return;
+                        };
+                        old_scene.free();
+                    })?
                     .await;
                 } else {
                     tracing::error!(
@@ -129,17 +140,15 @@ impl super::SceneManager {
             let next = next_scene.await;
             let manager = self.clone();
             let next_df = next.clone();
-            unsafe {
-                IdleTask::defer_local(move || {
-                    #[allow(unused_unsafe)]
-                    // NOTE :: have to do this on its own line so the borrow gets dropped
-                    let index = manager.len().saturating_sub(1);
-                    unsafe {
-                        manager.insert_scene(index, next_df);
-                    }
-                })
-                .await;
-            }
+            IdleTask::defer_local(move || {
+                #[allow(unused_unsafe)]
+                // NOTE :: have to do this on its own line so the borrow gets dropped
+                let index = manager.len().saturating_sub(1);
+                unsafe {
+                    manager.insert_scene(index, next_df);
+                }
+            })?
+            .await;
 
             tracing::trace!("waiting on transition.finish()"); // me irl...
             // finish the transition...
@@ -150,22 +159,20 @@ impl super::SceneManager {
             tracing::trace!("removing scene transition");
             // remove the transition...
             let manager = self.clone();
-            unsafe {
-                IdleTask::defer_local(move || {
-                    #[allow(unused_unsafe)]
-                    let Some(transition) = (unsafe { manager.pop_scene() }) else {
-                        tracing::error!(
-                            "tried to pop scene transition, but there are no scenes on the stack"
-                        );
-                        return;
-                    };
-                    transition.free();
-                })
-                .await;
-            }
+            IdleTask::defer_local(move || {
+                #[allow(unused_unsafe)]
+                let Some(transition) = (unsafe { manager.pop_scene() }) else {
+                    tracing::error!(
+                        "tried to pop scene transition, but there are no scenes on the stack"
+                    );
+                    return;
+                };
+                transition.free();
+            })?
+            .await;
 
             // we're done yay
-            next
+            Ok(next)
         })
     }
 }
