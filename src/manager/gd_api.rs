@@ -1,7 +1,10 @@
 use std::{ops::Deref, rc::Rc};
 
 use godot::{
-    classes::{INode, Node, PackedScene, ResourceLoader},
+    classes::{
+        INode, Node, PackedScene, ResourceLoader,
+        class_macros::private::virtuals::ZipReader::Variant, resource_loader::CacheMode,
+    },
     obj::{Base, Singleton, WithBaseField},
     prelude::{GString, Gd, StringName},
     register::{GodotClass, godot_api},
@@ -93,17 +96,25 @@ impl SceneManagerNode {
     }
 
     #[func]
-    fn transition_scene(&mut self, transition_node: Gd<Node>, next_scene: Gd<Node>) {
+    fn transition_scene(&mut self, transition_node: Gd<Node>, next_scene: Variant) {
+        let node =
+            match crate::resource::load_something_to_node(next_scene, CacheMode::REUSE, false) {
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::error!(%error, "could not start scene transition");
+                    return;
+                }
+            };
         self.run_deferred(move |mng: &mut Self| {
             let task = match unsafe {
                 mng.state
                     .manager()
                     .clone()
-                    .transition_scene(transition_node, std::future::ready(next_scene))
+                    .transition_scene(transition_node, node)
             } {
                 Ok(t) => t,
-                Err(e) => {
-                    tracing::error!(error = %e, "could not start scene transition");
+                Err(error) => {
+                    tracing::error!(%error, "could not start scene transition");
                     return;
                 }
             };

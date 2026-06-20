@@ -12,14 +12,16 @@ mod scene_transition_inner;
 use scene_transition_inner::*;
 
 #[derive(thiserror::Error, Debug)]
-pub enum SceneTransitionError {
+pub enum SceneTransitionError<NodeError> {
     #[error("unrecognized scene transition type: {}", 0)]
     UnrecognizedTransitionType(Gd<Node>),
     #[error("scene transition processed outside the main thread")]
     NotMainThread,
+    #[error(transparent)]
+    Node(NodeError),
 }
 
-impl<T> From<IdleTaskError<T>> for SceneTransitionError {
+impl<T, N> From<IdleTaskError<T>> for SceneTransitionError<N> {
     fn from(value: IdleTaskError<T>) -> Self {
         match value {
             IdleTaskError::NotMainThread(_) => Self::NotMainThread,
@@ -40,7 +42,7 @@ struct SceneTransition {
 }
 
 impl SceneTransition {
-    fn new(transition: Gd<Node>) -> Result<Self, SceneTransitionError> {
+    fn new<N>(transition: Gd<Node>) -> Result<Self, SceneTransitionError<N>> {
         if let Ok(anim) = transition.clone().try_cast::<AnimationPlayer>() {
             Ok(Self {
                 inner: SceneTransitionInner::Animation(SceneTransitionAnimation::new(anim)),
@@ -69,13 +71,13 @@ impl super::SceneManager {
     /// # Safety
     ///
     /// Must only be called in contexts in which it's safe to mutate the scene tree.
-    pub unsafe fn transition_scene<'result>(
+    pub unsafe fn transition_scene<'result, NodeError>(
         self: Rc<Self>,
         transition_node: Gd<Node>,
-        next_scene: impl Future<Output = Gd<Node>> + 'result,
+        next_scene: impl Future<Output = Result<Gd<Node>, NodeError>> + 'result,
     ) -> Result<
-        impl Future<Output = Result<Gd<Node>, SceneTransitionError>> + 'result,
-        SceneTransitionError,
+        impl Future<Output = Result<Gd<Node>, SceneTransitionError<NodeError>>> + 'result,
+        SceneTransitionError<NodeError>,
     > {
         tracing::debug!(
             %transition_node,
@@ -132,7 +134,10 @@ impl super::SceneManager {
 
             tracing::trace!("waiting on new scene to be inserted");
             // swap the scene...
-            let next = next_scene.await;
+            let next = match next_scene.await {
+                Ok(n) => n,
+                Err(e) => return Err(SceneTransitionError::Node(e)),
+            };
             let manager = self.clone();
             let next_df = next.clone();
             IdleTask::defer_local(move || {
