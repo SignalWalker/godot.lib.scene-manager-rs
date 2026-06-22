@@ -104,11 +104,9 @@ impl<O, T: FnOnce() -> O> IdleTask<O, T> {
         if !godot::init::is_main_thread() {
             return Err(IdleTaskError::NotMainThread(task));
         }
-        tracing::trace!("deferring local task");
         let returned = Self::new(task);
         let mut task = returned.clone();
         Callable::from_fn(task.to_string(), move |_: &[&Variant]| -> () {
-            tracing::trace!(%task, "invoking local task");
             task.invoke();
         })
         .call_deferred(&[]);

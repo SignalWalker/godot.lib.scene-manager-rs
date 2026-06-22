@@ -6,13 +6,20 @@ use godot::{
     task::FallibleSignalFutureError,
 };
 
-use crate::idle::{IdleTask, IdleTaskError};
+use crate::{
+    InsertSceneError,
+    idle::{IdleTask, IdleTaskError},
+};
 
 mod scene_transition_inner;
 use scene_transition_inner::*;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SceneTransitionError<NodeError> {
+    #[error("transition node ({0}) already has a parent")]
+    TransitionAlreadyHasParent(Gd<Node>),
+    #[error("scene node ({0}) already has a parent")]
+    SceneAlreadyHasParent(Gd<Node>),
     #[error("unrecognized scene transition type: {}", 0)]
     UnrecognizedTransitionType(Gd<Node>),
     #[error("scene transition processed outside the main thread")]
@@ -34,38 +41,14 @@ trait TransitionDriver {
         &'future mut self,
     ) -> impl Future<Output = Result<(), FallibleSignalFutureError>> + 'future;
 
-    fn finish(self) -> impl Future<Output = Result<(), FallibleSignalFutureError>>;
+    fn finish(self) -> impl Future<Output = Result<Gd<Node>, FallibleSignalFutureError>>;
+
+    fn scene(&self) -> Gd<Node>;
 }
 
-struct SceneTransition {
-    inner: SceneTransitionInner,
-}
+pub type SceneTransitionResult<Error> = Result<(Gd<Node>, usize), SceneTransitionError<Error>>;
 
-impl SceneTransition {
-    fn new<N>(transition: Gd<Node>) -> Result<Self, SceneTransitionError<N>> {
-        if let Ok(anim) = transition.clone().try_cast::<AnimationPlayer>() {
-            Ok(Self {
-                inner: SceneTransitionInner::Animation(SceneTransitionAnimation::new(anim)),
-            })
-        } else {
-            Err(SceneTransitionError::UnrecognizedTransitionType(transition))
-        }
-    }
-
-    fn start(&mut self) -> impl Future<Output = Result<(), FallibleSignalFutureError>> {
-        match &mut self.inner {
-            SceneTransitionInner::Animation(anim) => anim.start(),
-        }
-    }
-
-    /// Returns a [Future] that finishes when the scene transition is finished and ready to be
-    /// popped from the scene stack.
-    fn finish(self) -> impl Future<Output = Result<(), FallibleSignalFutureError>> {
-        match self.inner {
-            SceneTransitionInner::Animation(anim) => anim.finish(),
-        }
-    }
-}
+pub type TransitionTargetResult<Error> = Result<Gd<Node>, Error>;
 
 impl super::SceneManager {
     /// # Safety
@@ -73,45 +56,58 @@ impl super::SceneManager {
     /// Must only be called in contexts in which it's safe to mutate the scene tree.
     pub unsafe fn transition_scene<'result, NodeError>(
         self: Rc<Self>,
-        transition_node: Gd<Node>,
-        next_scene: impl Future<Output = Result<Gd<Node>, NodeError>> + 'result,
+        transition: Gd<Node>,
+        next_scene: impl Future<Output = TransitionTargetResult<NodeError>> + 'result,
     ) -> Result<
-        impl Future<Output = Result<Gd<Node>, SceneTransitionError<NodeError>>> + 'result,
+        impl Future<Output = SceneTransitionResult<NodeError>> + 'result,
         SceneTransitionError<NodeError>,
     > {
-        tracing::debug!(
-            %transition_node,
-            "transition_scene"
-        );
         // construct the transition...
-        let mut transition = SceneTransition::new(transition_node.clone())?;
+        let trans = match transition.try_cast::<AnimationPlayer>() {
+            Ok(anim) => {
+                return unsafe {
+                    self.transition_scene_inner(SceneTransitionAnimation::new(anim), next_scene)
+                };
+            }
+            Err(trans) => trans,
+        };
+        // TODO :: support callable-based transition
+        Err(SceneTransitionError::UnrecognizedTransitionType(trans))
+    }
 
+    unsafe fn transition_scene_inner<'result, Error>(
+        self: Rc<Self>,
+        mut transition: impl TransitionDriver + 'result,
+        next_scene: impl Future<Output = TransitionTargetResult<Error>> + 'result,
+    ) -> Result<
+        impl Future<Output = SceneTransitionResult<Error>> + 'result,
+        SceneTransitionError<Error>,
+    > {
         let old_scene = self.current_scene().map(|s| s.clone());
 
         // put it on the scene stack...
-        unsafe {
-            self.push_scene(transition_node);
-        }
+        unsafe { self.clone().push_scene(transition.scene()) }.map_err(|err| match err {
+            crate::PushSceneError::SceneAlreadyHasParent(gd) => {
+                SceneTransitionError::TransitionAlreadyHasParent(gd)
+            }
+        })?;
 
         // wait for it to finish...
         Ok(async move {
-            tracing::trace!("waiting on transition.start()"); // me irl
             // wait for the transition to be ready...
             if let Err(error) = transition.start().await {
                 tracing::error!(%error, "scene transition start");
             }
 
-            tracing::trace!("removing old scene");
             // remove the old scene...
             if let Some(old_scene) = old_scene {
                 if self
                     .scene_stack
                     .borrow()
                     .iter()
-                    .any(|sc| sc.scene == old_scene)
+                    .any(|sc| *sc.scene() == old_scene)
                 {
                     let manager = self.clone();
-                    tracing::trace!("waiting on IdleTask for old scene to be removed and freed");
                     IdleTask::defer_local(move || {
                         let Some(old_scene) = (unsafe { manager.try_remove_scene(&old_scene) })
                         else {
@@ -121,7 +117,7 @@ impl super::SceneManager {
                             );
                             return;
                         };
-                        old_scene.free();
+                        old_scene.0.free();
                     })?
                     .await;
                 } else {
@@ -132,7 +128,6 @@ impl super::SceneManager {
                 }
             }
 
-            tracing::trace!("waiting on new scene to be inserted");
             // swap the scene...
             let next = match next_scene.await {
                 Ok(n) => n,
@@ -140,37 +135,56 @@ impl super::SceneManager {
             };
             let manager = self.clone();
             let next_df = next.clone();
+            let transition_df = transition.scene();
+            let scene_index = match IdleTask::defer_local(move || {
+                // insert the new scene below the scene transition
+                let index = match manager.index_of(&transition_df) {
+                    Some(i) => i.saturating_sub(1),
+                    None => {
+                        tracing::error!("could not find scene transition node; inserting transition target scene at top of stack");
+                        manager.len()
+                    },
+                };
+                unsafe { manager.insert_scene(index, next_df) }.map(|_: ()| index)
+            })?
+            .await
+            {
+                Ok(index) => index,
+                Err(InsertSceneError::SceneAlreadyHasParent(scene)) => {
+                    return Err(SceneTransitionError::SceneAlreadyHasParent(scene));
+                }
+                Err(InsertSceneError::IndexOutOfBounds(index)) => unreachable!(
+                    "the index ({index}) is either one less than the index of a scene already on the stack (the transition scene), or it is the top of the stack, so, either way, it should always be in bounds"
+                ),
+            };
+
+            // finish the transition...
+            let transition_scene = match transition.finish().await {
+                Ok(scn) => Some(scn),
+                Err(error) => {
+                    tracing::error!(%error, "scene transition finish");
+                    None
+                }
+            };
+
+            // remove the transition...
+            let manager = self.clone();
             IdleTask::defer_local(move || {
-                // NOTE :: have to do this on its own line so the borrow gets dropped
-                let index = manager.len().saturating_sub(1);
-                unsafe {
-                    manager.insert_scene(index, next_df);
+                if let Some(transition) = transition_scene {
+                    let Some(transition) = (unsafe { manager.try_remove_scene(&transition) }) else {
+                        tracing::error!(
+                            %transition,
+                            "tried to remove scene transition, but it wasn't in the stack (did it remove itself?)"
+                        );
+                        return;
+                    };
+                    transition.0.free();
                 }
             })?
             .await;
 
-            tracing::trace!("waiting on transition.finish()"); // me irl...
-            // finish the transition...
-            if let Err(error) = transition.finish().await {
-                tracing::error!(%error, "scene transition finish");
-            };
-
-            tracing::trace!("removing scene transition");
-            // remove the transition...
-            let manager = self.clone();
-            IdleTask::defer_local(move || {
-                let Some(transition) = (unsafe { manager.pop_scene() }) else {
-                    tracing::error!(
-                        "tried to pop scene transition, but there are no scenes on the stack"
-                    );
-                    return;
-                };
-                transition.free();
-            })?
-            .await;
-
             // we're done yay
-            Ok(next)
+            Ok((next, scene_index))
         })
     }
 }

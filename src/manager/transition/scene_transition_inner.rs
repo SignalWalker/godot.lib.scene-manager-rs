@@ -1,13 +1,8 @@
 use futures::{FutureExt, TryFutureExt};
 use godot::{
-    classes::AnimationPlayer,
+    classes::{AnimationPlayer, Node},
     prelude::{Gd, StringName},
-    task::FallibleSignalFutureError,
 };
-
-pub(super) enum SceneTransitionInner {
-    Animation(SceneTransitionAnimation),
-}
 
 pub(super) struct SceneTransitionAnimation {
     transition: Gd<AnimationPlayer>,
@@ -20,9 +15,15 @@ impl SceneTransitionAnimation {
 }
 
 impl super::TransitionDriver for SceneTransitionAnimation {
+    fn scene(&self) -> Gd<Node> {
+        self.transition.clone().upcast()
+    }
+
     fn start<'future>(
         &'future mut self,
-    ) -> impl Future<Output = Result<(), FallibleSignalFutureError>> + 'future {
+    ) -> impl futures::Future<
+        Output = std::result::Result<(), godot::task::FallibleSignalFutureError>,
+    > + 'future {
         let start_anim = {
             let autoplay = self.transition.get_autoplay().clone();
             if !autoplay.is_empty() {
@@ -86,26 +87,34 @@ impl super::TransitionDriver for SceneTransitionAnimation {
         }.boxed_local()
     }
 
-    fn finish(mut self) -> impl Future<Output = Result<(), FallibleSignalFutureError>> {
+    fn finish(
+        mut self,
+    ) -> impl futures::Future<
+        Output = std::result::Result<
+            godot::prelude::Gd<godot::prelude::Node>,
+            godot::task::FallibleSignalFutureError,
+        >,
+    > {
         // if we have an ending animation...
         if self
             .transition
             .get_animation_list()
             .contains("transition_end")
         {
+            let future_res = self.transition.clone().upcast();
             // ...play that and return a future waiting for it to finish
             let res = self
                 .transition
                 .signals()
                 .animation_finished()
                 .to_fallible_future()
-                .map_ok(|_| ())
+                .map_ok(move |_| future_res)
                 .boxed_local();
             self.transition.play_ex().name("transition_end").done();
             res
         } else {
             // otherwise, we're done :>
-            std::future::ready(Ok(())).boxed_local()
+            std::future::ready(Ok(self.transition.upcast())).boxed_local()
         }
     }
 }

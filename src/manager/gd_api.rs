@@ -2,15 +2,15 @@ use std::{ops::Deref, rc::Rc};
 
 use godot::{
     classes::{
-        INode, Node, PackedScene, ResourceLoader,
-        class_macros::private::virtuals::ZipReader::Variant, resource_loader::CacheMode,
+        INode, Node, class_macros::private::virtuals::ZipReader::Variant,
+        resource_loader::CacheMode,
     },
-    obj::{Base, Singleton, WithBaseField},
+    obj::{Base, WithBaseField, WithUserSignals},
     prelude::{GString, Gd, StringName},
     register::{GodotClass, godot_api},
 };
 
-use crate::settings;
+use crate::{resource::LoadNodeFromPathError, settings};
 
 enum SceneManagerState {
     Initializing {
@@ -57,54 +57,189 @@ pub struct SceneManagerNode {
 
 #[godot_api]
 impl SceneManagerNode {
+    /// Emitted when a new scene is pushed, after it is added to the scene tree.
+    ///
+    /// The second parameter is the index of the pushed scene within the scene stack.
+    ///
+    /// This signal is only emitted when a scene is pushed to the **top** of the stack. As in, it will
+    /// **not** be emitted if a scene is inserted into the stack below the top.
+    #[signal]
+    pub fn scene_pushed(scene: Gd<Node>, index: u32);
+
+    /// Emitted when a scene is popped, after it is removed from the scene tree.
+    ///
+    /// The second parameter is the former index of the popped scene within the scene stack.
+    ///
+    /// This signal is only emitted when a scene is popped from the **top** of the stack.
+    /// (ex. if the scene stack is `[A, B]` and `A` is removed, this signal will **not** be emitted.
+    /// However, if the scene stack is `[D, C]` and `C` is removed, this signal **will** be
+    /// emitted.)
+    #[signal]
+    pub fn scene_popped(scene: Gd<Node>, index: u32);
+
     /// Get the current scene.
     #[func]
-    fn get_current_scene(&self) -> Option<Gd<Node>> {
+    pub fn get_current_scene(&self) -> Option<Gd<Node>> {
         self.state.manager().current_scene().map(|sc| sc.clone())
     }
 
     /// Get the current scene's parent.
     #[func]
-    fn get_scene_parent(&self) -> Gd<Node> {
+    pub fn get_scene_parent(&self) -> Gd<Node> {
         self.state.scene_parent().clone()
     }
 
+    /// Push a new scene to the top of the stack. Must only be called during idle time.
     #[func]
-    fn push_scene(&mut self, scene: Gd<Node>) {
-        self.run_deferred(move |mng: &mut Self| unsafe {
-            mng.state.manager().push_scene(scene);
-        });
-    }
-
-    #[func]
-    fn pop_scene(&mut self) {
-        self.run_deferred(move |mng: &mut Self| unsafe {
-            if let Some(scene) = mng.state.manager().pop_scene() {
-                scene.free();
+    pub fn push_scene_immediate(&mut self, scene: Gd<Node>) -> bool {
+        let index = match unsafe { self.state.manager().clone().push_scene(scene.clone()) } {
+            Ok(i) => i,
+            Err(error) => {
+                tracing::error!(%error, "could not push scene");
+                return false;
             }
+        };
+
+        // TODO :: use saturating_cast once that's stable
+        self.signals()
+            .scene_pushed()
+            .emit(&scene, u32::try_from(index).unwrap_or(u32::MAX));
+
+        true
+    }
+
+    /// Push a new scene to the top of the stack during idle time.
+    #[func]
+    pub fn push_scene(&mut self, scene: Gd<Node>) {
+        self.run_deferred(move |mng: &mut Self| {
+            mng.push_scene_immediate(scene);
         });
     }
 
+    /// Remove a scene from the stack. Must only be called during idle time.
     #[func]
-    fn swap_scene(&mut self, scene: Gd<Node>) {
-        self.run_deferred(move |mng: &mut Self| unsafe {
-            if let Some(scene) = mng.state.manager().pop_scene() {
-                scene.free();
-            }
-            mng.state.manager().push_scene(scene);
-        });
-    }
-
-    #[func]
-    fn transition_scene(&mut self, transition_node: Gd<Node>, next_scene: Variant) {
-        let node =
-            match crate::resource::load_something_to_node(next_scene, CacheMode::REUSE, false) {
-                Ok(n) => n,
-                Err(error) => {
-                    tracing::error!(%error, "could not start scene transition");
-                    return;
+    #[must_use]
+    pub fn remove_scene_immediate(&mut self, scene: Gd<Node>) -> Option<Gd<Node>> {
+        match unsafe { self.state.manager().clone().try_remove_scene(&scene) } {
+            Some((scene, index)) => {
+                if index == self.state.manager().len() {
+                    // TODO :: use saturating_cast once that's stable
+                    self.signals()
+                        .scene_popped()
+                        .emit(&scene, index.try_into().unwrap_or(u32::MAX));
                 }
+                Some(scene)
+            }
+            None => None,
+        }
+    }
+
+    /// Remove a scene from the stack and free it, during idle time.
+    #[func]
+    pub fn remove_scene(&mut self, scene: Gd<Node>) {
+        self.run_deferred(move |mng: &mut Self| {
+            let Some(scene) = mng.remove_scene_immediate(scene.clone()) else {
+                tracing::error!(%scene, "tried to remove scene, but it isn't on the scene stack");
+                return;
             };
+            scene.free();
+        });
+    }
+
+    /// Pop a scene from the top of the stack. Must only be called during idle time.
+    #[func]
+    #[must_use]
+    pub fn pop_scene_immediate(&mut self) -> Option<Gd<Node>> {
+        match unsafe { self.state.manager().pop_scene() } {
+            Some(scene) => {
+                let index = self.state.manager().len();
+                // TODO :: use saturating_cast once that's stable
+                self.signals()
+                    .scene_popped()
+                    .emit(&scene, u32::try_from(index).unwrap_or(u32::MAX));
+                Some(scene)
+            }
+            None => None,
+        }
+    }
+
+    /// Pop a scene from the top of the stack and free it, during idle time.
+    #[func]
+    pub fn pop_scene(&mut self) {
+        self.run_deferred(move |mng: &mut Self| {
+            if let Some(scene) = unsafe { mng.state.manager().pop_scene() } {
+                let index = mng.state.manager().len();
+                // TODO :: use saturating_cast once that's stable
+                mng.signals()
+                    .scene_popped()
+                    .emit(&scene, u32::try_from(index).unwrap_or(u32::MAX));
+                scene.free();
+            }
+        });
+    }
+
+    /// Replace the current scene with a new one and free the old one.
+    #[func]
+    #[must_use]
+    pub fn swap_scene_immediate(&mut self, scene: Gd<Node>) -> Option<Gd<Node>> {
+        let old = unsafe { self.state.manager().pop_scene() };
+        if let Some(old) = old.as_ref() {
+            let index = self.state.manager().len();
+            // TODO :: use saturating_cast once that's stable
+            self.signals()
+                .scene_popped()
+                .emit(old, index.try_into().unwrap_or(u32::MAX));
+        }
+        let index = match unsafe { self.state.manager().clone().push_scene(scene.clone()) } {
+            Ok(i) => i,
+            Err(error) => {
+                tracing::error!(%error, "could not push scene");
+                return old;
+            }
+        };
+        // TODO :: use saturating_cast once that's stable
+        self.signals()
+            .scene_pushed()
+            .emit(&scene, index.try_into().unwrap_or(u32::MAX));
+
+        old
+    }
+
+    /// Replace the current scene with a new one and free the old one, during idle time.
+    #[func]
+    pub fn swap_scene(&mut self, scene: Gd<Node>) {
+        self.run_deferred(move |mng: &mut Self| {
+            if let Some(old) = mng.swap_scene_immediate(scene) {
+                old.free();
+            }
+        });
+    }
+
+    /// Start a scene transition with the given transition scene and a target scene.
+    ///
+    /// Currently, `transition_node` can be an AnimationPlayer with three animations:
+    /// - `transition_start`, which plays as soon as it enters
+    /// - `transition_ready`, which is optional and plays after `transition_start`
+    /// - `transition_end`, which is optional and plays after `transition_start` or `transition_ready`
+    ///
+    /// `next_scene` can be any of:
+    /// - A path (String or StringName) to a PackedScene resource, which will be loaded in a
+    /// separate thread during the transition
+    /// - A PackedScene, which will be instantiated
+    /// - A Node
+    #[func]
+    pub fn transition_scene(&mut self, transition_node: Gd<Node>, next_scene: Variant) {
+        let node = match crate::resource::load_threaded_something_to_node(
+            next_scene,
+            CacheMode::REUSE,
+            false,
+        ) {
+            Ok(n) => n,
+            Err(error) => {
+                tracing::error!(%error, "could not start loading next scene for scene transition");
+                return;
+            }
+        };
         self.run_deferred(move |mng: &mut Self| {
             let task = match unsafe {
                 mng.state
@@ -118,66 +253,60 @@ impl SceneManagerNode {
                     return;
                 }
             };
+
+            let mng = mng.to_gd();
             godot::task::spawn(async move {
-                if let Err(error) = task.await {
-                    tracing::error!(%error, "could not complete scene transition");
-                };
+                match task.await {
+                    Ok((scene, index)) => {
+                        mng.signals()
+                            .scene_pushed()
+                            .emit(&scene, index.try_into().unwrap_or(u32::MAX));
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "could not complete scene transition");
+                    }
+                }
             });
         });
     }
+
+    /// Given an argument, load it to a Node.
+    ///
+    /// The argument can be any of:
+    /// - A path (String or StringName) to a PackedScene resource, which will be loaded and instantiated
+    /// - A PackedScene, which will be instantiated
+    /// - A Node, which will be returned unchanged
+    #[func]
+    fn load_to_node(arg: Variant) -> Option<Gd<Node>> {
+        crate::resource::load_something_to_node(arg, CacheMode::REUSE).ok()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum GetRootSceneError {
+    #[error("could not find scene_manager/runtime/root_scene setting")]
+    SettingMissing,
+    #[error("could not convert scene_manager/runtime/root_scene to StringName: {0}")]
+    SettingIsNotStringName(#[from] godot::meta::error::ConvertError),
+    #[error("scene_manager/runtime/root_scene is not set")]
+    SettingIsUnset,
+    #[error(transparent)]
+    Load(#[from] LoadNodeFromPathError),
 }
 
 impl SceneManagerNode {
-    fn get_root_scene() -> Option<Gd<Node>> {
+    fn get_root_scene() -> Result<Gd<Node>, GetRootSceneError> {
         let Some(root_scene_path) = settings::get("runtime/root_scene") else {
-            tracing::error!("could not find scene_manager/runtime/root_scene setting");
-            return None;
+            return Err(GetRootSceneError::SettingMissing);
         };
-        let path = match root_scene_path.try_to::<StringName>() {
-            Ok(p) => p,
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    "could not convert scene_manager/runtime/root_scene to StringName",
-                );
-                return None;
-            }
-        };
+        let path = root_scene_path.try_to::<StringName>()?;
         if path.is_empty() {
             // TODO :: should we warn about this? this is what happens when you haven't set a root
             // scene, so this is the default state (as long as nothing's broken)
-            return None;
+            return Err(GetRootSceneError::SettingIsUnset);
         }
-        let Some(resource) = ResourceLoader::singleton()
-            .load_ex(&GString::from(&path))
-            .type_hint("PackedScene")
-            .done()
-        else {
-            tracing::error!(%path, "could not load scene");
-            return None;
-        };
-        let root_scene_packed = match resource.try_cast::<PackedScene>() {
-            Ok(r) => r,
-            Err(error) => {
-                tracing::error!(
-                    %path,
-                    %error,
-                    "could not cast loaded resource to PackedScene",
-                );
-                return None;
-            }
-        };
-        match root_scene_packed.instantiate() {
-            Some(res) => Some(res),
-            None => {
-                tracing::error!(
-                    %path,
-                    packed_scene = %root_scene_packed,
-                    "could not instantiate PackedScene",
-                );
-                None
-            }
-        }
+        crate::resource::load_node_from_path(&GString::from(&path), CacheMode::REUSE)
+            .map_err(From::from)
     }
 }
 
@@ -187,7 +316,14 @@ impl INode for SceneManagerNode {
         Self {
             base,
             state: SceneManagerState::Initializing {
-                root_scene: Self::get_root_scene(),
+                root_scene: match Self::get_root_scene() {
+                    Ok(node) => Some(node),
+                    Err(GetRootSceneError::SettingIsUnset) => None,
+                    Err(error) => {
+                        tracing::error!(%error, "could not load root node; defaulting to scene tree root");
+                        None
+                    }
+                },
             },
         }
     }
@@ -260,8 +396,22 @@ impl SceneManagerNode {
             tree_root.add_child(&*self.state.root());
         }
 
-        unsafe {
-            self.state.manager().push_scene(tree_current);
+        if let Err(error) = unsafe {
+            self.state
+                .manager()
+                .clone()
+                .push_scene(tree_current.clone())
+        } {
+            tracing::error!(%error, "could not push initial scene");
+        } else {
+            let index = self
+                .state
+                .manager()
+                .len()
+                .saturating_sub(1)
+                .try_into()
+                .unwrap_or(u32::MAX);
+            self.signals().scene_pushed().emit(&tree_current, index)
         }
     }
 }

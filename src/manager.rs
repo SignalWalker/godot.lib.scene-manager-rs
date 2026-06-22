@@ -1,10 +1,6 @@
-use std::{cell::RefCell, ops::Deref};
+use std::{cell::RefCell, ops::Deref, rc::Rc};
 
-use godot::{
-    classes::{Node, node::ProcessMode},
-    obj::NewAlloc,
-    prelude::Gd,
-};
+use godot::{classes::Node, obj::NewAlloc, prelude::Gd};
 
 mod transition;
 
@@ -12,6 +8,28 @@ mod internal;
 use internal::*;
 
 pub mod gd_api;
+
+#[derive(Debug, thiserror::Error)]
+pub enum PushSceneError {
+    #[error("scene ({0}) already has a parent node")]
+    SceneAlreadyHasParent(Gd<Node>),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InsertSceneError {
+    #[error("index {0} out of bounds")]
+    IndexOutOfBounds(usize),
+    #[error("scene ({0}) already has a parent node")]
+    SceneAlreadyHasParent(Gd<Node>),
+}
+
+impl From<PushSceneError> for InsertSceneError {
+    fn from(value: PushSceneError) -> Self {
+        match value {
+            PushSceneError::SceneAlreadyHasParent(gd) => Self::SceneAlreadyHasParent(gd),
+        }
+    }
+}
 
 pub struct SceneManager {
     /// The root node of the scene
@@ -39,7 +57,10 @@ impl SceneManager {
     /// Get the topmost scene on the stack.
     #[inline]
     pub fn current_scene<'scene>(&'scene self) -> Option<impl Deref<Target = Gd<Node>> + 'scene> {
-        std::cell::Ref::filter_map(self.scene_stack.borrow(), |st| st.last().map(|s| &s.scene)).ok()
+        std::cell::Ref::filter_map(self.scene_stack.borrow(), |st| {
+            st.last().map(StackData::scene)
+        })
+        .ok()
     }
 
     /// Get the root of the scene
@@ -63,33 +84,31 @@ impl SceneManager {
         self.scene_stack.borrow().is_empty()
     }
 
+    pub fn index_of(&self, scene: &Gd<Node>) -> Option<usize> {
+        self.scene_stack
+            .borrow()
+            .iter()
+            .position(|scn| scn.scene() == scene)
+    }
+
     /// Push a new scene to the stack.
     ///
     /// # Safety
     ///
     /// Must only be called in contexts where it's safe to modify the scene tree.
-    #[tracing::instrument]
-    pub unsafe fn push_scene(&self, new: Gd<Node>) {
-        tracing::debug!(scene = %new, "push_scene");
-        if let Some(mut parent) = new.get_parent() {
-            tracing::error!(
-                %parent,
-                "pushing scene that already has a parent; reparenting...",
-            );
-            parent.remove_child(&new);
+    pub unsafe fn push_scene(self: Rc<Self>, new: Gd<Node>) -> Result<usize, PushSceneError> {
+        if new.get_parent().is_some() {
+            return Err(PushSceneError::SceneAlreadyHasParent(new));
         }
 
         if let Some(old) = self.scene_stack.borrow_mut().last_mut() {
-            // store the old scene's process mode and pause it
-            old.initial_process_mode = old.scene.get_process_mode();
-            old.scene.set_process_mode(ProcessMode::DISABLED);
+            old.pause();
         }
 
-        self.scene_stack
-            .borrow_mut()
-            .push(StackData::from(new.clone()));
-
+        let data = self.clone().register_scene(new.clone());
+        self.scene_stack.borrow_mut().push(data);
         self.scene_parent.borrow_mut().add_child(&new);
+        Ok(self.len().saturating_sub(1))
     }
 
     /// Pop the current scene.
@@ -98,20 +117,20 @@ impl SceneManager {
     ///
     /// Must only be called in contexts where it's safe to modify the scene tree.
     #[must_use]
-    #[tracing::instrument]
     pub unsafe fn pop_scene(&self) -> Option<Gd<Node>> {
-        tracing::debug!("pop_scene");
         // NOTE :: you can't just use `if let Some(old) = self.scene_stack.borrow_mut().pop()` here
         // because then the RefMut stays in scope
         let old = self.scene_stack.borrow_mut().pop();
         if let Some(old) = old {
+            // unregister the old scene
+            let old = self.unregister_scene(old);
             // remove it from the scene tree...
-            self.scene_parent.borrow_mut().remove_child(&old.scene);
+            self.scene_parent.borrow_mut().remove_child(&old);
             // update the process mode on the next scene (if it exists)...
             if let Some(new) = self.scene_stack.borrow_mut().last_mut() {
-                new.scene.set_process_mode(new.initial_process_mode);
+                new.unpause();
             }
-            Some(old.scene)
+            Some(old)
         } else {
             None
         }
@@ -122,24 +141,27 @@ impl SceneManager {
     /// # Safety
     ///
     /// Must only be called in contexts in which it's safe to mutate the scene tree.
-    #[tracing::instrument]
-    pub unsafe fn insert_scene(&self, index: usize, new: Gd<Node>) {
-        tracing::debug!(index, scene = %new, "insert_scene");
-        debug_assert!(index <= self.scene_stack.borrow().len());
-
-        if index == self.scene_stack.borrow().len() {
+    pub unsafe fn insert_scene(
+        self: Rc<Self>,
+        index: usize,
+        new: Gd<Node>,
+    ) -> Result<(), InsertSceneError> {
+        let stack_len = self.scene_stack.borrow().len();
+        if index > stack_len {
+            return Err(InsertSceneError::IndexOutOfBounds(index));
+        }
+        if index == stack_len {
             // we're inserting it as the last scene, which is the same as pushing it, so lets defer
-            // to `push_scene` (since we also want this to emit signals, etc. when we're putting
-            // something on the top of the stack)
+            // to `push_scene`
             unsafe {
-                return self.push_scene(new);
+                return self.push_scene(new).map(|_| ()).map_err(From::from);
             }
         }
 
         // pause the new scene, to keep it consistent with what would have happened had it been
         // pushed normally
-        let mut data = StackData::new(new.clone());
-        data.scene.set_process_mode(ProcessMode::DISABLED);
+        let mut data = self.clone().register_scene(new.clone());
+        data.pause();
 
         // put it on the stack
         self.scene_stack.borrow_mut().insert(index, data);
@@ -152,9 +174,11 @@ impl SceneManager {
             self.scene_parent.borrow_mut().move_child(&dummy, 0);
             dummy.replace_by(&new);
             dummy.free();
+            Ok(())
         } else {
             let prev_sibling = &mut self.scene_stack.borrow_mut()[index - 1];
-            prev_sibling.scene.add_sibling(&new);
+            prev_sibling.add_sibling(&new);
+            Ok(())
         }
     }
 
@@ -164,49 +188,42 @@ impl SceneManager {
     ///
     /// Must only be called in contexts in which it's safe to mutate the scene tree.
     #[must_use]
-    #[tracing::instrument]
     pub unsafe fn try_remove_scene_at(&self, index: usize) -> Option<Gd<Node>> {
-        tracing::debug!(index, "try_remove_scene_at");
         if index >= self.scene_stack.borrow().len() {
-            tracing::error!(
-                index,
-                len = self.scene_stack.borrow().len(),
-                "scene index out of bounds"
-            );
             return None;
-        } else if index == self.scene_stack.borrow().len() - 1 {
+        }
+        if index == self.scene_stack.borrow().len() - 1 {
             // we're removing the top scene, so we'll defer to `pop_scene`
             unsafe {
                 return self.pop_scene();
             }
         }
 
-        // remove the scene...
-        let mut data = self.scene_stack.borrow_mut().remove(index);
-        // restore its old process mode (just in case we want that for some reason?)...
-        data.scene.set_process_mode(data.initial_process_mode);
+        // remove the scene from the stack...
+        let scene = self.unregister_scene(self.scene_stack.borrow_mut().remove(index));
         // remove it from the tree :>
-        self.scene_parent.borrow_mut().remove_child(&data.scene);
+        self.scene_parent.borrow_mut().remove_child(&scene);
 
-        Some(data.scene)
+        Some(scene)
     }
 
     /// # Safety
     ///
     /// Must only be called in contexts in which it's safe to mutate the scene tree.
     #[must_use]
-    #[tracing::instrument]
-    pub unsafe fn try_remove_scene(&self, scene: &Gd<Node>) -> Option<Gd<Node>> {
-        tracing::debug!(?scene, "try_remove_scene");
-        let Some(index) = self
-            .scene_stack
-            .borrow()
-            .iter()
-            .position(|sc| sc.scene == *scene)
-        else {
-            tracing::error!(%scene, "tried to remove scene from the scene stack, but it's not there");
-            return None;
+    pub unsafe fn try_remove_scene(&self, scene: &Gd<Node>) -> Option<(Gd<Node>, usize)> {
+        let index = self.index_of(scene)?;
+        unsafe { self.try_remove_scene_at(index) }.map(|node| (node, index))
+    }
+
+    fn scene_exiting_tree(&self, scene: Gd<Node>) {
+        tracing::warn!(%scene, "unexpected scene exiting tree; please use SceneManager.remove_scene instead");
+        let Some(index) = self.index_of(&scene) else {
+            tracing::error!(%scene, "received tree_exiting, but the node exiting the tree is not on the stack (the tree_exiting signal should already be disconnected)");
+            return;
         };
-        unsafe { self.try_remove_scene_at(index) }
+        let data = self.scene_stack.borrow_mut().remove(index);
+        // we're just dropping it without freeing because it seems not to be under our control anymore
+        let _ = self.unregister_scene(data);
     }
 }
