@@ -19,6 +19,3 @@ uuid = { version = "^1.23", features = ["v4"] }
 thiserror = "^2.0"
 
 tracing = "^0.1"
-
-[lib]
-crate-type = ["cdylib", "rlib"]
