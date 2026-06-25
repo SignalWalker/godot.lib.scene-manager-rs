@@ -27,8 +27,6 @@ pub enum ThreadedLoadError {
     NoTree,
     #[error("found scene tree, but it was of an unrecognized type")]
     UnrecognizedTree,
-    #[error("scene tree has no root node")]
-    NoRoot,
     #[error("load_threaded_get_status returned LOADED, but load_threaded_get returned nothing")]
     ResultMissing,
     #[error(
@@ -125,8 +123,7 @@ pub fn load_threaded(
         .ok_or(ThreadedLoadError::NoTree)?
         .try_cast::<SceneTree>()
         .map_err(|_| ThreadedLoadError::UnrecognizedTree)?
-        .get_root()
-        .ok_or(ThreadedLoadError::NoRoot)?;
+        .get_root();
 
     let future = LoadFuture::new();
 

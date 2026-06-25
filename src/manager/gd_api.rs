@@ -335,11 +335,7 @@ impl INode for SceneManagerNode {
             // either we loaded a scene in init(), or...
             let mut root = root_scene.take().unwrap_or_else(|| {
                 // ...we didn't get a root scene during init, so we'll use the current tree root
-                self.base()
-                    .get_tree()
-                    .get_root()
-                    .expect("scene tree should have a root, since we've entered it")
-                    .upcast()
+                self.base().get_tree_or_null().expect("we've just entered the tree, so we should be able to get a reference to it").get_root().upcast()
             });
             // either get the scene parent from `get_scene_manager_parent()` or just use the root itself
             let scene_parent = if root.has_method(GET_PARENT_FN) {
@@ -388,9 +384,7 @@ impl SceneManagerNode {
             .get_parent()
             .expect("the tree's current scene should have a parent, since we've only just started the program and we should be the only ones changing that")
             .remove_child(&tree_current);
-        let mut tree_root = tree
-            .get_root()
-            .expect("tree should have a root, since we've already entered it");
+        let mut tree_root = tree.get_root();
         // add our current root to the scene (as long as it's not already the root of the scene)
         if self.state.root().instance_id() != tree_root.instance_id() {
             tree_root.add_child(&*self.state.root());
