@@ -111,6 +111,24 @@ impl SceneManager {
         Ok(self.len().saturating_sub(1))
     }
 
+    /// Pop a scene from the stack without removing it from the scene tree.
+    unsafe fn pop_scene_without_removing_from_tree(&self) -> Option<Gd<Node>> {
+        // NOTE :: you can't just use `if let Some(old) = self.scene_stack.borrow_mut().pop()` here
+        // because then the RefMut stays in scope
+        let old = self.scene_stack.borrow_mut().pop();
+        if let Some(old) = old {
+            // unregister the old scene
+            let old = self.unregister_scene(old);
+            // update the process mode on the next scene (if it exists)...
+            if let Some(new) = self.scene_stack.borrow_mut().last_mut() {
+                new.unpause();
+            }
+            Some(old)
+        } else {
+            None
+        }
+    }
+
     /// Pop the current scene.
     ///
     /// # Safety
@@ -118,18 +136,10 @@ impl SceneManager {
     /// Must only be called in contexts where it's safe to modify the scene tree.
     #[must_use]
     pub unsafe fn pop_scene(&self) -> Option<Gd<Node>> {
-        // NOTE :: you can't just use `if let Some(old) = self.scene_stack.borrow_mut().pop()` here
-        // because then the RefMut stays in scope
-        let old = self.scene_stack.borrow_mut().pop();
-        if let Some(old) = old {
-            // unregister the old scene
-            let old = self.unregister_scene(old);
+        // pop the scene...
+        if let Some(old) = unsafe { self.pop_scene_without_removing_from_tree() } {
             // remove it from the scene tree...
             self.scene_parent.borrow_mut().remove_child(&old);
-            // update the process mode on the next scene (if it exists)...
-            if let Some(new) = self.scene_stack.borrow_mut().last_mut() {
-                new.unpause();
-            }
             Some(old)
         } else {
             None
@@ -201,6 +211,7 @@ impl SceneManager {
 
         // remove the scene from the stack...
         let scene = self.unregister_scene(self.scene_stack.borrow_mut().remove(index));
+
         // remove it from the tree :>
         self.scene_parent.borrow_mut().remove_child(&scene);
 
@@ -217,13 +228,21 @@ impl SceneManager {
     }
 
     fn scene_exiting_tree(&self, scene: Gd<Node>) {
-        tracing::warn!(%scene, "unexpected scene exiting tree; please use SceneManager.remove_scene instead");
         let Some(index) = self.index_of(&scene) else {
             tracing::error!(%scene, "received tree_exiting, but the node exiting the tree is not on the stack (the tree_exiting signal should already be disconnected)");
             return;
         };
-        let data = self.scene_stack.borrow_mut().remove(index);
-        // we're just dropping it without freeing because it seems not to be under our control anymore
-        let _ = self.unregister_scene(data);
+        if index == self.scene_stack.borrow().len() - 1 {
+            // the scene is the current top of the stack, so we'll defer to `pop_scene()`,
+            // because that has some extra side effects.
+            //
+            // we're just dropping it without freeing because it seems not to be under our control anymore
+            let _ = unsafe { self.pop_scene_without_removing_from_tree() };
+        } else {
+            // the scene is not the current top of the stack, so we can just remove it.
+            let data = self.scene_stack.borrow_mut().remove(index);
+            // we're just dropping the scene without freeing because it seems not to be under our control anymore
+            let _ = self.unregister_scene(data);
+        }
     }
 }

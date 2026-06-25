@@ -14,6 +14,10 @@ pub(super) struct StackData {
     initial_process_mode: ProcessMode,
     /// The connect handle for this scene's tree_exit handler
     tree_exit_handle: Option<ConnectHandle>,
+
+    #[cfg(debug_assertions)]
+    /// Whether this StackData has been unregistered
+    registered: bool,
 }
 
 impl StackData {
@@ -22,6 +26,8 @@ impl StackData {
             initial_process_mode: scene.get_process_mode(),
             scene,
             tree_exit_handle: Some(tree_exit_handle),
+            #[cfg(debug_assertions)]
+            registered: true,
         }
     }
 
@@ -46,6 +52,10 @@ impl StackData {
 
 impl Drop for StackData {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        if self.registered {
+            tracing::error!(scene = %self.scene, "StackData dropped without being unregistered");
+        }
         if let Some(handle) = self.tree_exit_handle.take()
             && handle.is_connected()
         {
@@ -66,6 +76,11 @@ impl super::SceneManager {
 
     #[must_use]
     pub(super) fn unregister_scene(&self, mut data: StackData) -> Gd<Node> {
+        #[cfg(debug_assertions)]
+        {
+            data.registered = false;
+        }
+
         data.unpause();
         data.scene.clone()
     }
