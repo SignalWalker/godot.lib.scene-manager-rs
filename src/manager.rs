@@ -5,7 +5,10 @@ use godot::{classes::Node, obj::NewAlloc, prelude::Gd};
 mod transition;
 
 mod internal;
+use godot_utils::TypedInstanceId;
 use internal::*;
+
+use crate::gd_api::SceneManagerNode;
 
 pub mod gd_api;
 
@@ -32,6 +35,8 @@ impl From<PushSceneError> for InsertSceneError {
 }
 
 pub struct SceneManager {
+    node_id: TypedInstanceId<gd_api::SceneManagerNode>,
+
     /// The root node of the scene
     root: RefCell<Gd<Node>>,
     /// The node to which scenes will be added (which may be the same node as `root`)
@@ -46,12 +51,21 @@ impl std::fmt::Debug for SceneManager {
 }
 
 impl SceneManager {
-    pub fn new(root: Gd<Node>, scene_parent: Option<Gd<Node>>) -> Self {
+    pub fn new(
+        node: &Gd<SceneManagerNode>,
+        root: Gd<Node>,
+        scene_parent: Option<Gd<Node>>,
+    ) -> Self {
         Self {
+            node_id: TypedInstanceId::from_gd(node).unwrap(),
             scene_parent: RefCell::new(scene_parent.unwrap_or_else(|| root.clone())),
             root: RefCell::new(root),
             scene_stack: RefCell::new(Vec::new()),
         }
+    }
+
+    pub fn node(&self) -> Gd<SceneManagerNode> {
+        self.node_id.get().unwrap()
     }
 
     /// Get the topmost scene on the stack.
@@ -96,7 +110,7 @@ impl SceneManager {
     /// # Safety
     ///
     /// Must only be called in contexts where it's safe to modify the scene tree.
-    pub unsafe fn push_scene(self: Rc<Self>, new: Gd<Node>) -> Result<usize, PushSceneError> {
+    pub unsafe fn push_scene(self: Rc<Self>, new: Gd<Node>) -> Result<(), PushSceneError> {
         if new.get_parent().is_some() {
             return Err(PushSceneError::SceneAlreadyHasParent(new));
         }
@@ -105,12 +119,22 @@ impl SceneManager {
             old.pause();
         }
 
+        // push scene
         let data = self.clone().register_scene(new.clone());
+        let index = self.len();
         self.scene_stack.borrow_mut().push(data);
         self.scene_parent.borrow_mut().add_child(&new);
-        Ok(self.len().saturating_sub(1))
+        // emit signal
+        // TODO :: use saturating_cast once that's stable
+        self.node()
+            .signals()
+            .scene_pushed()
+            .emit(&new, u32::try_from(index).unwrap_or(u32::MAX));
+
+        Ok(())
     }
 
+    #[must_use]
     /// Pop a scene from the stack without removing it from the scene tree.
     unsafe fn pop_scene_without_removing_from_tree(&self) -> Option<Gd<Node>> {
         // NOTE :: you can't just use `if let Some(old) = self.scene_stack.borrow_mut().pop()` here
@@ -140,6 +164,12 @@ impl SceneManager {
         if let Some(old) = unsafe { self.pop_scene_without_removing_from_tree() } {
             // remove it from the scene tree...
             self.scene_parent.borrow_mut().remove_child(&old);
+            // emit signal
+            // TODO :: use saturating_cast once that's stable
+            self.node()
+                .signals()
+                .scene_popped()
+                .emit(&old, self.len().try_into().unwrap_or(u32::MAX));
             Some(old)
         } else {
             None
@@ -238,6 +268,12 @@ impl SceneManager {
             //
             // we're just dropping it without freeing because it seems not to be under our control anymore
             let _ = unsafe { self.pop_scene_without_removing_from_tree() };
+            // emit signal
+            // TODO :: use saturating_cast once that's stable
+            self.node()
+                .signals()
+                .scene_popped()
+                .emit(&scene, self.len().try_into().unwrap_or(u32::MAX));
         } else {
             // the scene is not the current top of the stack, so we can just remove it.
             let data = self.scene_stack.borrow_mut().remove(index);

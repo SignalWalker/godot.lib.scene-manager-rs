@@ -6,6 +6,7 @@ use godot::{
     prelude::Gd,
     signal::ConnectHandle,
 };
+use godot_utils::DropHandle;
 
 pub(super) struct StackData {
     /// The scene.
@@ -13,7 +14,7 @@ pub(super) struct StackData {
     /// The scene's process mode as it was before it got paused by a higher scene
     initial_process_mode: ProcessMode,
     /// The connect handle for this scene's tree_exit handler
-    tree_exit_handle: Option<ConnectHandle>,
+    _tree_exit_handle: DropHandle,
 
     #[cfg(debug_assertions)]
     /// Whether this StackData has been unregistered
@@ -25,7 +26,7 @@ impl StackData {
         Self {
             initial_process_mode: scene.get_process_mode(),
             scene,
-            tree_exit_handle: Some(tree_exit_handle),
+            _tree_exit_handle: DropHandle::new(tree_exit_handle),
             #[cfg(debug_assertions)]
             registered: true,
         }
@@ -50,16 +51,11 @@ impl StackData {
     }
 }
 
+#[cfg(debug_assertions)]
 impl Drop for StackData {
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
         if self.registered {
             tracing::error!(scene = %self.scene, "StackData dropped without being unregistered");
-        }
-        if let Some(handle) = self.tree_exit_handle.take()
-            && handle.is_connected()
-        {
-            handle.disconnect();
         }
     }
 }

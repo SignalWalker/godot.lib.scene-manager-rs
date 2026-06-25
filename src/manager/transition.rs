@@ -183,6 +183,20 @@ impl super::SceneManager {
             })?
             .await;
 
+            // emit the push signal, if our new scene is the top scene
+            if self
+                .scene_stack
+                .borrow()
+                .last()
+                .is_some_and(|last| *last.scene() == next)
+            {
+                // TODO :: saturating cast
+                self.node()
+                    .signals()
+                    .scene_pushed()
+                    .emit(&next, self.len().try_into().unwrap_or(u32::MAX));
+            }
+
             // we're done yay
             Ok((next, scene_index))
         })

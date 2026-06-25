@@ -206,6 +206,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "godot-utils"
+version = "0.1.0"
+source = "git+https://github.com/SignalWalker/godot.lib.godot-utils#1022d202a6d0d2a4de6ab5548a6d191979ceea5b"
+dependencies = [
+ "godot",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -338,6 +346,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "godot",
+ "godot-utils",
  "parking_lot",
  "thiserror",
  "tracing",

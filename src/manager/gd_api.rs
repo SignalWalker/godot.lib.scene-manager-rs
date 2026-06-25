@@ -55,6 +55,12 @@ pub struct SceneManagerNode {
     state: SceneManagerState,
 }
 
+impl SceneManagerNode {
+    pub fn manager(&self) -> &Rc<super::SceneManager> {
+        self.state.manager()
+    }
+}
+
 #[godot_api]
 impl SceneManagerNode {
     /// Emitted when a new scene is pushed, after it is added to the scene tree.
@@ -92,18 +98,10 @@ impl SceneManagerNode {
     /// Push a new scene to the top of the stack. Must only be called during idle time.
     #[func]
     pub fn push_scene_immediate(&mut self, scene: Gd<Node>) -> bool {
-        let index = match unsafe { self.state.manager().clone().push_scene(scene.clone()) } {
-            Ok(i) => i,
-            Err(error) => {
-                tracing::error!(%error, "could not push scene");
-                return false;
-            }
+        if let Err(error) = unsafe { self.state.manager().clone().push_scene(scene.clone()) } {
+            tracing::error!(%error, "could not push scene");
+            return false;
         };
-
-        // TODO :: use saturating_cast once that's stable
-        self.signals()
-            .scene_pushed()
-            .emit(&scene, u32::try_from(index).unwrap_or(u32::MAX));
 
         true
     }
@@ -120,18 +118,7 @@ impl SceneManagerNode {
     #[func]
     #[must_use]
     pub fn remove_scene_immediate(&mut self, scene: Gd<Node>) -> Option<Gd<Node>> {
-        match unsafe { self.state.manager().clone().try_remove_scene(&scene) } {
-            Some((scene, index)) => {
-                if index == self.state.manager().len() {
-                    // TODO :: use saturating_cast once that's stable
-                    self.signals()
-                        .scene_popped()
-                        .emit(&scene, index.try_into().unwrap_or(u32::MAX));
-                }
-                Some(scene)
-            }
-            None => None,
-        }
+        unsafe { self.state.manager().clone().try_remove_scene(&scene) }.map(|(scene, _)| scene)
     }
 
     /// Remove a scene from the stack and free it, during idle time.
@@ -150,17 +137,7 @@ impl SceneManagerNode {
     #[func]
     #[must_use]
     pub fn pop_scene_immediate(&mut self) -> Option<Gd<Node>> {
-        match unsafe { self.state.manager().pop_scene() } {
-            Some(scene) => {
-                let index = self.state.manager().len();
-                // TODO :: use saturating_cast once that's stable
-                self.signals()
-                    .scene_popped()
-                    .emit(&scene, u32::try_from(index).unwrap_or(u32::MAX));
-                Some(scene)
-            }
-            None => None,
-        }
+        unsafe { self.state.manager().pop_scene() }
     }
 
     /// Pop a scene from the top of the stack and free it, during idle time.
@@ -168,11 +145,6 @@ impl SceneManagerNode {
     pub fn pop_scene(&mut self) {
         self.run_deferred(move |mng: &mut Self| {
             if let Some(scene) = unsafe { mng.state.manager().pop_scene() } {
-                let index = mng.state.manager().len();
-                // TODO :: use saturating_cast once that's stable
-                mng.signals()
-                    .scene_popped()
-                    .emit(&scene, u32::try_from(index).unwrap_or(u32::MAX));
                 scene.free();
             }
         });
@@ -182,26 +154,8 @@ impl SceneManagerNode {
     #[func]
     #[must_use]
     pub fn swap_scene_immediate(&mut self, scene: Gd<Node>) -> Option<Gd<Node>> {
-        let old = unsafe { self.state.manager().pop_scene() };
-        if let Some(old) = old.as_ref() {
-            let index = self.state.manager().len();
-            // TODO :: use saturating_cast once that's stable
-            self.signals()
-                .scene_popped()
-                .emit(old, index.try_into().unwrap_or(u32::MAX));
-        }
-        let index = match unsafe { self.state.manager().clone().push_scene(scene.clone()) } {
-            Ok(i) => i,
-            Err(error) => {
-                tracing::error!(%error, "could not push scene");
-                return old;
-            }
-        };
-        // TODO :: use saturating_cast once that's stable
-        self.signals()
-            .scene_pushed()
-            .emit(&scene, index.try_into().unwrap_or(u32::MAX));
-
+        let old = self.pop_scene_immediate();
+        self.push_scene_immediate(scene);
         old
     }
 
@@ -254,17 +208,9 @@ impl SceneManagerNode {
                 }
             };
 
-            let mng = mng.to_gd();
             godot::task::spawn(async move {
-                match task.await {
-                    Ok((scene, index)) => {
-                        mng.signals()
-                            .scene_pushed()
-                            .emit(&scene, index.try_into().unwrap_or(u32::MAX));
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "could not complete scene transition");
-                    }
+                if let Err(error) = task.await {
+                    tracing::error!(%error, "could not complete scene transition");
                 }
             });
         });
@@ -360,7 +306,7 @@ impl INode for SceneManagerNode {
                 None
             };
             self.state = SceneManagerState::Ready {
-                manager: Rc::new(super::SceneManager::new(root, scene_parent)),
+                manager: Rc::new(super::SceneManager::new(&self.to_gd(), root, scene_parent)),
             }
         }
     }
@@ -397,15 +343,6 @@ impl SceneManagerNode {
                 .push_scene(tree_current.clone())
         } {
             tracing::error!(%error, "could not push initial scene");
-        } else {
-            let index = self
-                .state
-                .manager()
-                .len()
-                .saturating_sub(1)
-                .try_into()
-                .unwrap_or(u32::MAX);
-            self.signals().scene_pushed().emit(&tree_current, index)
         }
     }
 }

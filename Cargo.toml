@@ -10,6 +10,8 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 godot = { version = "^0.5", features = ["api-4-7", "experimental-threads"] }
 
+godot-utils = { git = "https://github.com/SignalWalker/godot.lib.godot-utils" }
+
 parking_lot = "^0.12"
 
 futures = "^0.3"
