@@ -41,6 +41,7 @@ pub struct SceneManager {
     root: RefCell<Gd<Node>>,
     /// The node to which scenes will be added (which may be the same node as `root`)
     scene_parent: RefCell<Gd<Node>>,
+    /// The scene stack
     scene_stack: RefCell<Vec<StackData>>,
 }
 
@@ -66,6 +67,14 @@ impl SceneManager {
 
     pub fn node(&self) -> Gd<SceneManagerNode> {
         self.node_id.get().unwrap()
+    }
+
+    pub fn stack_cloned(&self) -> Vec<Gd<Node>> {
+        self.scene_stack
+            .borrow()
+            .iter()
+            .map(|data| data.scene().clone())
+            .collect()
     }
 
     /// Get the topmost scene on the stack.

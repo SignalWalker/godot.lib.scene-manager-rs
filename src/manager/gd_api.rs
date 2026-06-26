@@ -188,6 +188,14 @@ impl SceneManagerNode {
     /// - A Node
     #[func]
     pub fn transition_scene(&mut self, transition_node: Gd<Node>, next_scene: Variant) {
+        let transition = match transition_node.try_cast::<godot::classes::AnimationPlayer>() {
+            Ok(anim) => anim,
+            Err(node) => {
+                tracing::error!(expected = "AnimationPlayer", found = %node, "unrecognized scene transition type");
+                return;
+            }
+        };
+
         let node = match crate::resource::load_threaded_something_to_node(
             next_scene,
             CacheMode::REUSE,
@@ -199,12 +207,13 @@ impl SceneManagerNode {
                 return;
             }
         };
+
         self.run_deferred(move |mng: &mut Self| {
             let task = match unsafe {
                 mng.state
                     .manager()
                     .clone()
-                    .transition_scene(transition_node, node)
+                    .transition_scene(transition, node)
             } {
                 Ok(t) => t,
                 Err(error) => {
