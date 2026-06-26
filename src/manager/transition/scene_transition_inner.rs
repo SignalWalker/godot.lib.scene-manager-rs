@@ -2,7 +2,16 @@ use futures::{FutureExt, TryFutureExt};
 use godot::{
     classes::{AnimationPlayer, Node},
     prelude::{Gd, StringName},
+    task::FallibleSignalFutureError,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum AnimationTransitionError {
+    #[error("scene transition ({0}) contains no animations")]
+    NoAnimations(Gd<AnimationPlayer>),
+    #[error(transparent)]
+    Signal(#[from] FallibleSignalFutureError),
+}
 
 pub(super) struct SceneTransitionAnimation {
     transition: Gd<AnimationPlayer>,
@@ -15,15 +24,15 @@ impl SceneTransitionAnimation {
 }
 
 impl super::TransitionDriver for SceneTransitionAnimation {
+    type Error = AnimationTransitionError;
+
     fn scene(&self) -> Gd<Node> {
         self.transition.clone().upcast()
     }
 
     fn start<'future>(
         &'future mut self,
-    ) -> impl futures::Future<
-        Output = std::result::Result<(), godot::task::FallibleSignalFutureError>,
-    > + 'future {
+    ) -> impl futures::Future<Output = std::result::Result<(), Self::Error>> + 'future {
         let start_anim = {
             let autoplay = self.transition.get_autoplay().clone();
             if !autoplay.is_empty() {
@@ -45,8 +54,10 @@ impl super::TransitionDriver for SceneTransitionAnimation {
                     .as_ref()
                     .map(StringName::from)
                 else {
-                    tracing::error!(transition = %self.transition, "scene transition does not contain any animations");
-                    return std::future::ready(Ok(())).boxed_local();
+                    return std::future::ready(Err(Self::Error::NoAnimations(
+                        self.transition.clone(),
+                    )))
+                    .boxed_local();
                 };
                 tracing::warn!(
                     animation = %res,
@@ -67,7 +78,7 @@ impl super::TransitionDriver for SceneTransitionAnimation {
             {
                 let (finished_anim,) = anim_finished.await?;
                 if finished_anim != start_anim {
-                    tracing::error!(
+                    tracing::warn!(
                         "scene transition started animation {}, but the next finished animation was {}",
                         start_anim,
                         finished_anim
@@ -90,10 +101,7 @@ impl super::TransitionDriver for SceneTransitionAnimation {
     fn finish(
         mut self,
     ) -> impl futures::Future<
-        Output = std::result::Result<
-            godot::prelude::Gd<godot::prelude::Node>,
-            godot::task::FallibleSignalFutureError,
-        >,
+        Output = std::result::Result<godot::prelude::Gd<godot::prelude::Node>, Self::Error>,
     > {
         // if we have an ending animation...
         if self
@@ -109,6 +117,7 @@ impl super::TransitionDriver for SceneTransitionAnimation {
                 .animation_finished()
                 .to_fallible_future()
                 .map_ok(move |_| future_res)
+                .map_err(From::from)
                 .boxed_local();
             self.transition.play_ex().name("transition_end").done();
             res

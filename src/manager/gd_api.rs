@@ -5,7 +5,7 @@ use godot::{
         INode, Node, class_macros::private::virtuals::ZipReader::Variant,
         resource_loader::CacheMode,
     },
-    obj::{Base, WithBaseField, WithUserSignals},
+    obj::{Base, WithBaseField},
     prelude::{GString, Gd, StringName},
     register::{GodotClass, godot_api},
 };
@@ -82,6 +82,11 @@ impl SceneManagerNode {
     /// emitted.)
     #[signal]
     pub fn scene_popped(scene: Gd<Node>, index: u32);
+
+    /// Emitted during a scene transition, after the new scene has been instantiated and pushed but
+    /// before the transition is complete.
+    #[signal]
+    pub fn scene_transitioning(target: Gd<Node>, index: u32);
 
     /// Get the current scene.
     #[func]

@@ -15,7 +15,7 @@ mod scene_transition_inner;
 use scene_transition_inner::*;
 
 #[derive(thiserror::Error, Debug)]
-pub enum SceneTransitionError<NodeError> {
+pub enum SceneTransitionError<TargetSceneError> {
     #[error("transition node ({0}) already has a parent")]
     TransitionAlreadyHasParent(Gd<Node>),
     #[error("scene node ({0}) already has a parent")]
@@ -24,11 +24,12 @@ pub enum SceneTransitionError<NodeError> {
     UnrecognizedTransitionType(Gd<Node>),
     #[error("scene transition processed outside the main thread")]
     NotMainThread,
-    #[error(transparent)]
-    Node(NodeError),
+
+    #[error("could not load target scene: {0}")]
+    TargetScene(#[source] TargetSceneError),
 }
 
-impl<T, N> From<IdleTaskError<T>> for SceneTransitionError<N> {
+impl<T, E> From<IdleTaskError<T>> for SceneTransitionError<E> {
     fn from(value: IdleTaskError<T>) -> Self {
         match value {
             IdleTaskError::NotMainThread(_) => Self::NotMainThread,
@@ -37,11 +38,12 @@ impl<T, N> From<IdleTaskError<T>> for SceneTransitionError<N> {
 }
 
 trait TransitionDriver {
-    fn start<'future>(
-        &'future mut self,
-    ) -> impl Future<Output = Result<(), FallibleSignalFutureError>> + 'future;
+    type Error;
 
-    fn finish(self) -> impl Future<Output = Result<Gd<Node>, FallibleSignalFutureError>>;
+    fn start<'future>(&'future mut self)
+    -> impl Future<Output = Result<(), Self::Error>> + 'future;
+
+    fn finish(self) -> impl Future<Output = Result<Gd<Node>, Self::Error>>;
 
     fn scene(&self) -> Gd<Node>;
 }
@@ -75,14 +77,18 @@ impl super::SceneManager {
         Err(SceneTransitionError::UnrecognizedTransitionType(trans))
     }
 
-    unsafe fn transition_scene_inner<'result, Error>(
+    unsafe fn transition_scene_inner<'result, Driver, Error>(
         self: Rc<Self>,
-        mut transition: impl TransitionDriver + 'result,
+        mut transition: Driver,
         next_scene: impl Future<Output = TransitionTargetResult<Error>> + 'result,
     ) -> Result<
         impl Future<Output = SceneTransitionResult<Error>> + 'result,
         SceneTransitionError<Error>,
-    > {
+    >
+    where
+        Driver: TransitionDriver + 'result,
+        Driver::Error: std::fmt::Display,
+    {
         let old_scene = self.current_scene().map(|s| s.clone());
 
         // put it on the scene stack...
@@ -131,7 +137,7 @@ impl super::SceneManager {
             // swap the scene...
             let next = match next_scene.await {
                 Ok(n) => n,
-                Err(e) => return Err(SceneTransitionError::Node(e)),
+                Err(e) => return Err(SceneTransitionError::TargetScene(e)),
             };
             let manager = self.clone();
             let next_df = next.clone();
@@ -157,6 +163,13 @@ impl super::SceneManager {
                     "the index ({index}) is either one less than the index of a scene already on the stack (the transition scene), or it is the top of the stack, so, either way, it should always be in bounds"
                 ),
             };
+
+            // emit scene transition signal...
+            self.node()
+                .signals()
+                .scene_transitioning()
+                // TODO :: saturating cast
+                .emit(&next, scene_index.try_into().unwrap_or(u32::MAX));
 
             // finish the transition...
             let transition_scene = match transition.finish().await {
